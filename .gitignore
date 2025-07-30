@@ -1,5 +1,5 @@
 /config
-config2/*
+!config/custom_components/llama_conversation
 
 tests/testing_config/deps
 tests/testing_config/home-assistant.log*
