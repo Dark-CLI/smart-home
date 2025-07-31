@@ -69,6 +69,7 @@ from .utils import (
     validate_llama_cpp_python_installation,
     format_url,
 )
+from .tool_processor import ToolProcessor
 from .const import (
     CONF_CHAT_MODEL,
     CONF_MAX_TOKENS,
@@ -84,7 +85,6 @@ from .const import (
     CONF_EXTRA_ATTRIBUTES_TO_EXPOSE,
     CONF_PROMPT_TEMPLATE,
     CONF_TOOL_FORMAT,
-    CONF_TOOL_MULTI_TURN_CHAT,
     CONF_ENABLE_FLASH_ATTENTION,
     CONF_USE_GBNF_GRAMMAR,
     CONF_GBNF_GRAMMAR_FILE,
@@ -122,7 +122,6 @@ from .const import (
     DEFAULT_EXTRA_ATTRIBUTES_TO_EXPOSE,
     DEFAULT_PROMPT_TEMPLATE,
     DEFAULT_TOOL_FORMAT,
-    DEFAULT_TOOL_MULTI_TURN_CHAT,
     DEFAULT_ENABLE_FLASH_ATTENTION,
     DEFAULT_USE_GBNF_GRAMMAR,
     DEFAULT_GBNF_GRAMMAR_FILE,
@@ -205,25 +204,35 @@ async def async_setup_entry(
 def _convert_content(chat_content: conversation.Content) -> dict[str, str]:
     """Create tool response content."""
     role_name = None
+    message = None
     if isinstance(chat_content, conversation.ToolResultContent):
         role_name = "tool"
+        message = chat_content.tool_result
     elif isinstance(chat_content, conversation.AssistantContent):
         role_name = "assistant"
+        message = chat_content.content
     elif isinstance(chat_content, conversation.UserContent):
         role_name = "user"
+        message = chat_content.content
     elif isinstance(chat_content, conversation.SystemContent):
         role_name = "system"
+        message = chat_content.content
     else:
         raise ValueError(f"Unexpected content type: {type(chat_content)}")
 
-    return {"role": role_name, "message": chat_content.content}
+    return {"role": role_name, "message": message}
 
 
 def _convert_content_back(
     agent_id: str, message_history_entry: dict[str, str]
 ) -> conversation.Content:
     if message_history_entry["role"] == "tool":
-        return conversation.ToolResultContent(content=message_history_entry["message"])
+        return conversation.ToolResultContent(
+            agent_id=agent_id,
+            tool_call_id="fake-id",
+            tool_name="hass-tools",
+            tool_result=message_history_entry["message"],
+        )
     if message_history_entry["role"] == "assistant":
         return conversation.AssistantContent(
             agent_id=agent_id, content=message_history_entry["message"]
@@ -384,6 +393,12 @@ class LocalLLMAgent(ConversationEntity, AbstractConversationAgent):
         user_input: conversation.ConversationInput,
         chat_log: conversation.ChatLog,
     ) -> conversation.ConversationResult:
+        import debugpy
+
+        # debugpy.listen(("0.0.0.0", 5678))
+        # print("🧠 Waiting for debugger attach...")
+        # debugpy.wait_for_client()
+        # debugpy.breakpoint()
         raw_prompt = self.entry.options.get(CONF_PROMPT, DEFAULT_PROMPT)
         prompt_template = self.entry.options.get(
             CONF_PROMPT_TEMPLATE, DEFAULT_PROMPT_TEMPLATE
@@ -466,182 +481,19 @@ class LocalLLMAgent(ConversationEntity, AbstractConversationAgent):
             else:
                 message_history[0] = system_prompt
 
-        # generate a response
-        try:
-            _LOGGER.debug(message_history)
-            response = await self._async_generate(message_history)
-            # ---------- debug block start ----------
-            import debugpy
+        MAX_RETRIES = 5
+        retries = 0
+        to_say = ""
 
-            debugpy.listen(("0.0.0.0", 5678))
-            print("🧠 Waiting for debugger attach...")
-            debugpy.wait_for_client()
-            debugpy.breakpoint()
-            # ---------- debug block end ----------
-            _LOGGER.debug(response)
+        if llm_api:
+            tool_processor = ToolProcessor(self.hass, llm_api, self.entry)
 
-        except Exception as err:
-            _LOGGER.exception("There was a problem talking to the backend")
-
-            intent_response = intent.IntentResponse(language=user_input.language)
-            intent_response.async_set_error(
-                intent.IntentResponseErrorCode.FAILED_TO_HANDLE,
-                f"Sorry, there was a problem talking to the backend: {repr(err)}",
-            )
-            return ConversationResult(
-                response=intent_response, conversation_id=user_input.conversation_id
-            )
-
-        # remove end of text token if it was returned
-        response = response.replace(template_desc["assistant"]["suffix"], "")
-
-        # remove think blocks
-        response = re.sub(
-            rf"^.*?{template_desc['chain_of_thought']['suffix']}",
-            "",
-            response,
-            flags=re.DOTALL,
-        )
-
-        message_history.append({"role": "assistant", "message": response})
-        if remember_conversation:
-            if (
-                remember_num_interactions
-                and len(message_history) > (remember_num_interactions * 2) + 1
-            ):
-                for i in range(0, 2):
-                    message_history.pop(1)
-            chat_log.content = [
-                _convert_content_back(user_input.agent_id, message_history_entry)
-                for message_history_entry in message_history
-            ]
-
-        if llm_api is None:
-            # return the output without messing with it if there is no API exposed to the model
-            intent_response = intent.IntentResponse(language=user_input.language)
-            intent_response.async_set_speech(response.strip())
-            return ConversationResult(
-                response=intent_response, conversation_id=user_input.conversation_id
-            )
-
-        tool_response = None
-        # parse response
-        to_say = service_call_pattern.sub("", response.strip())
-        tool_response = None
-        for block in service_call_pattern.findall(response.strip()):
-            parsed_tool_call: dict = json.loads(block)
-
-            if llm_api.api.id == HOME_LLM_API_ID:
-                schema_to_validate = vol.Schema(
-                    {
-                        vol.Required("service"): str,
-                        vol.Required("target_device"): str,
-                        vol.Optional("rgb_color"): str,
-                        vol.Optional("brightness"): vol.Coerce(float),
-                        vol.Optional("temperature"): vol.Coerce(float),
-                        vol.Optional("humidity"): vol.Coerce(float),
-                        vol.Optional("fan_mode"): str,
-                        vol.Optional("hvac_mode"): str,
-                        vol.Optional("preset_mode"): str,
-                        vol.Optional("duration"): str,
-                        vol.Optional("item"): str,
-                    }
-                )
-            else:
-                schema_to_validate = vol.Schema(
-                    {
-                        vol.Required("name"): str,
-                        vol.Required("arguments"): dict,
-                    }
-                )
-
-            try:
-                schema_to_validate(parsed_tool_call)
-            except vol.Error as ex:
-                _LOGGER.info(
-                    f"LLM produced an improperly formatted response: {repr(ex)}"
-                )
-
-                intent_response = intent.IntentResponse(language=user_input.language)
-                intent_response.async_set_error(
-                    intent.IntentResponseErrorCode.NO_INTENT_MATCH,
-                    f"I'm sorry, I didn't produce a correctly formatted tool call! Please see the logs for more info.",
-                )
-                return ConversationResult(
-                    response=intent_response, conversation_id=user_input.conversation_id
-                )
-
-            _LOGGER.info(f"calling tool: {block}")
-
-            # try to fix certain arguments
-            args_dict = (
-                parsed_tool_call
-                if llm_api.api.id == HOME_LLM_API_ID
-                else parsed_tool_call["arguments"]
-            )
-
-            # make sure brightness is 0-255 and not a percentage
-            if "brightness" in args_dict and 0.0 < args_dict["brightness"] <= 1.0:
-                args_dict["brightness"] = int(args_dict["brightness"] * 255)
-
-            # convert string "tuple" to a list for RGB colors
-            if "rgb_color" in args_dict and isinstance(args_dict["rgb_color"], str):
-                args_dict["rgb_color"] = [
-                    int(x) for x in args_dict["rgb_color"][1:-1].split(",")
-                ]
-
-            if llm_api.api.id == HOME_LLM_API_ID:
-                to_say = to_say + parsed_tool_call.pop("to_say", "")
-                tool_input = llm.ToolInput(
-                    tool_name=SERVICE_TOOL_NAME,
-                    tool_args=parsed_tool_call,
-                )
-            else:
-                tool_input = llm.ToolInput(
-                    tool_name=parsed_tool_call["name"],
-                    tool_args=parsed_tool_call["arguments"],
-                )
-
-            tool_response = None
-            try:
-                tool_response = await llm_api.async_call_tool(tool_input)
-                _LOGGER.debug("Tool response: %s", tool_response)
-            except (HomeAssistantError, vol.Invalid) as e:
-                tool_response = {"error": type(e).__name__}
-                if str(e):
-                    tool_response["error_text"] = str(e)
-                _LOGGER.debug("Tool response: %s", tool_response)
-
-                intent_response = intent.IntentResponse(language=user_input.language)
-                intent_response.async_set_error(
-                    intent.IntentResponseErrorCode.NO_INTENT_MATCH,
-                    f"I'm sorry! I encountered an error calling the tool. See the logs for more info.",
-                )
-                return ConversationResult(
-                    response=intent_response, conversation_id=user_input.conversation_id
-                )
-
-        # handle models that generate a function call and wait for the result before providing a response
-        if (
-            self.entry.options.get(
-                CONF_TOOL_MULTI_TURN_CHAT, DEFAULT_TOOL_MULTI_TURN_CHAT
-            )
-            and tool_response is not None
-        ):
-            try:
-                message_history.append(
-                    {"role": "tool", "message": json.dumps(tool_response)}
-                )
-            except:
-                message_history.append(
-                    {"role": "tool", "message": "No tools were used in this response."}
-                )
-
-            # generate a response based on the tool result
+        while retries < MAX_RETRIES:
+            # generate a response
             try:
                 _LOGGER.debug(message_history)
-                to_say = await self._async_generate(message_history)
-                _LOGGER.debug(to_say)
+                response = await self._async_generate(message_history)
+                _LOGGER.debug(response)
 
             except Exception as err:
                 _LOGGER.exception("There was a problem talking to the backend")
@@ -655,8 +507,73 @@ class LocalLLMAgent(ConversationEntity, AbstractConversationAgent):
                     response=intent_response, conversation_id=user_input.conversation_id
                 )
 
+            # remove end of text token if it was returned
+            response = response.replace(template_desc["assistant"]["suffix"], "")
+
+            # remove think blocks
+            response = re.sub(
+                rf"^.*?{template_desc['chain_of_thought']['suffix']}",
+                "",
+                response,
+                flags=re.DOTALL,
+            )
+
             message_history.append({"role": "assistant", "message": response})
-            message_history.append({"role": "assistant", "message": to_say})
+
+            if llm_api is None:
+                # return the output without messing with it if there is no API exposed to the model
+                to_say = response.strip()
+                break
+
+            (
+                to_say,
+                tool_results_to_send,
+            ) = await tool_processor.async_process_tool_calls(response)
+
+            if not tool_results_to_send:
+                # All tools were successful actions
+                break
+
+            message_history.append(
+                {"role": "tool", "message": json.dumps(tool_results_to_send)}
+            )
+            retries += 1
+            continue
+
+        if retries >= MAX_RETRIES:
+            _LOGGER.warning("Max retries reached, summarizing failures.")
+            message_history.append(
+                {
+                    "role": "system",
+                    "message": "The previous tool calls failed multiple times. Please summarize the failures for the user and apologize.",
+                }
+            )
+            try:
+                to_say = await self._async_generate(message_history)
+            except Exception as err:
+                _LOGGER.exception(
+                    "There was a problem talking to the backend for summarization"
+                )
+                intent_response = intent.IntentResponse(language=user_input.language)
+                intent_response.async_set_error(
+                    intent.IntentResponseErrorCode.FAILED_TO_HANDLE,
+                    f"Sorry, there was a problem talking to the backend: {repr(err)}",
+                )
+                return ConversationResult(
+                    response=intent_response, conversation_id=user_input.conversation_id
+                )
+
+        if remember_conversation:
+            if (
+                remember_num_interactions
+                and len(message_history) > (remember_num_interactions * 2) + 1
+            ):
+                for i in range(0, 2):
+                    message_history.pop(1)
+            chat_log.content = [
+                _convert_content_back(user_input.agent_id, message_history_entry)
+                for message_history_entry in message_history
+            ]
 
         # generate intent response to Home Assistant
         intent_response = intent.IntentResponse(language=user_input.language)
