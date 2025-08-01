@@ -1,5 +1,3 @@
-"""Defines the various LLM Backend Agents"""
-
 from __future__ import annotations
 
 import aiohttp
@@ -175,10 +173,8 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 async def update_listener(hass: HomeAssistant, entry: ConfigEntry):
-    """Handle options update."""
     hass.data[DOMAIN][entry.entry_id] = entry
 
-    # call update handler
     agent: LocalLLMAgent = entry.runtime_data
     await hass.async_add_executor_job(agent._update_options)
 
@@ -190,19 +186,14 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> bool:
-    """Set up Local LLM Conversation from a config entry."""
-
-    # handle updates to the options
     entry.async_on_unload(entry.add_update_listener(update_listener))
 
-    # register the agent entity
     async_add_entities([entry.runtime_data])
 
     return True
 
 
 def _convert_content(chat_content: conversation.Content) -> dict[str, str]:
-    """Create tool response content."""
     role_name = None
     message = None
     if isinstance(chat_content, conversation.ToolResultContent):
@@ -244,17 +235,14 @@ def _convert_content_back(
 
 
 class LocalLLMAgent(ConversationEntity, AbstractConversationAgent):
-    """Base Local LLM conversation agent."""
-
     hass: HomeAssistant
     entry_id: str
     in_context_examples: list[dict]
 
     _attr_has_entity_name = True
-    _attr_supports_streaming = False  # TODO: add support for backends that can stream
+    _attr_supports_streaming = False
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
-        """Initialize the agent."""
         self._attr_name = entry.title
         self._attr_unique_id = entry.entry_id
 
@@ -280,21 +268,13 @@ class LocalLLMAgent(ConversationEntity, AbstractConversationAgent):
             )
 
     async def async_added_to_hass(self) -> None:
-        # chatgpt said this line is not required anymore
-        """When entity is added to Home Assistant."""
-        # await super().async_added_to_hass()
-        # assist_pipeline.async_migrate_engine(
-        #     self.hass, "conversation", self.entry.entry_id, self.entity_id
-        # )
-        # conversation.async_set_agent(self.hass, self.entry, self)
+        pass
 
     async def async_will_remove_from_hass(self) -> None:
-        """When entity will be removed from Home Assistant."""
         conversation.async_unset_agent(self.hass, self.entry)
         await super().async_will_remove_from_hass()
 
     def _load_icl_examples(self, filename: str):
-        """Load info used for generating in context learning examples"""
         try:
             icl_filename = os.path.join(os.path.dirname(__file__), filename)
 
@@ -348,23 +328,18 @@ class LocalLLMAgent(ConversationEntity, AbstractConversationAgent):
 
     @property
     def supported_languages(self) -> list[str] | Literal["*"]:
-        """Return a list of supported languages."""
         return MATCH_ALL
 
     def _load_model(self, entry: ConfigEntry) -> None:
-        """Load the model on the backend. Implemented by sub-classes"""
         raise NotImplementedError()
 
     async def _async_load_model(self, entry: ConfigEntry) -> str:
-        """Default implementation is to call _load_model() which probably does blocking stuff"""
         return await self.hass.async_add_executor_job(self._load_model, entry)
 
     def _generate(self, conversation: dict) -> str:
-        """Call the backend to generate a response from the conversation. Implemented by sub-classes"""
         raise NotImplementedError()
 
     async def _async_generate(self, conversation: dict) -> str:
-        """Default implementation is to call _generate() which probably does blocking stuff"""
         return await self.hass.async_add_executor_job(self._generate, conversation)
 
     def _warn_context_size(self):
@@ -379,7 +354,6 @@ class LocalLLMAgent(ConversationEntity, AbstractConversationAgent):
         )
 
     async def async_process(self, user_input: ConversationInput) -> ConversationResult:
-        """Process a sentence."""
         with (
             chat_session.async_get_chat_session(
                 self.hass, user_input.conversation_id
@@ -399,6 +373,7 @@ class LocalLLMAgent(ConversationEntity, AbstractConversationAgent):
         # print("🧠 Waiting for debugger attach...")
         # debugpy.wait_for_client()
         # debugpy.breakpoint()
+
         raw_prompt = self.entry.options.get(CONF_PROMPT, DEFAULT_PROMPT)
         prompt_template = self.entry.options.get(
             CONF_PROMPT_TEMPLATE, DEFAULT_PROMPT_TEMPLATE
@@ -413,24 +388,6 @@ class LocalLLMAgent(ConversationEntity, AbstractConversationAgent):
         remember_num_interactions = self.entry.options.get(
             CONF_REMEMBER_NUM_INTERACTIONS, DEFAULT_REMEMBER_NUM_INTERACTIONS
         )
-        service_call_regex = self.entry.options.get(
-            CONF_SERVICE_CALL_REGEX, DEFAULT_SERVICE_CALL_REGEX
-        )
-
-        try:
-            service_call_pattern = re.compile(service_call_regex, flags=re.MULTILINE)
-        except Exception as err:
-            _LOGGER.exception("There was a problem compiling the service call regex")
-
-            intent_response = intent.IntentResponse(language=user_input.language)
-            intent_response.async_set_error(
-                intent.IntentResponseErrorCode.UNKNOWN,
-                f"Sorry, there was a problem compiling the service call regex: {err}",
-            )
-
-            return ConversationResult(
-                response=intent_response, conversation_id=user_input.conversation_id
-            )
 
         llm_api: llm.APIInstance | None = None
         if self.entry.options.get(CONF_LLM_HASS_API):
@@ -532,6 +489,33 @@ class LocalLLMAgent(ConversationEntity, AbstractConversationAgent):
 
             if not tool_results_to_send:
                 # All tools were successful actions
+                if (
+                    retries > 0
+                ):  # If it's not the first attempt, and tools just succeeded
+                    # Instruct the LLM to generate a success message
+                    message_history.append(
+                        {
+                            "role": "system",
+                            "message": "All previous tool calls succeeded. Please provide a concise, user-friendly confirmation of the actions taken.",
+                        }
+                    )
+                    try:
+                        to_say = await self._async_generate(message_history)
+                    except Exception as err:
+                        _LOGGER.exception(
+                            "There was a problem talking to the backend for success summarization"
+                        )
+                        intent_response = intent.IntentResponse(
+                            language=user_input.language
+                        )
+                        intent_response.async_set_error(
+                            intent.IntentResponseErrorCode.FAILED_TO_HANDLE,
+                            f"Sorry, there was a problem talking to the backend: {repr(err)}",
+                        )
+                        return ConversationResult(
+                            response=intent_response,
+                            conversation_id=user_input.conversation_id,
+                        )
                 break
 
             message_history.append(
@@ -1389,8 +1373,6 @@ class BaseOpenAICompatibleAPIAgent(LocalLLMAgent):
     async def _async_generate_with_parameters(
         self, conversation: dict, endpoint: str, additional_params: dict
     ) -> str:
-        """Generate a response using the OpenAI-compatible API"""
-
         max_tokens = self.entry.options.get(CONF_MAX_TOKENS, DEFAULT_MAX_TOKENS)
         temperature = self.entry.options.get(CONF_TEMPERATURE, DEFAULT_TEMPERATURE)
         top_p = self.entry.options.get(CONF_TOP_P, DEFAULT_TOP_P)
@@ -1493,8 +1475,6 @@ class GenericOpenAIAPIAgent(BaseOpenAICompatibleAPIAgent):
 
 
 class GenericOpenAIResponsesAPIAgent(BaseOpenAICompatibleAPIAgent):
-    """Implements the OpenAPI-compatible Responses API backend."""
-
     _last_response_id: str | None = None
     _last_response_id_time: datetime.datetime = None
 
@@ -1505,15 +1485,11 @@ class GenericOpenAIResponsesAPIAgent(BaseOpenAICompatibleAPIAgent):
         )
 
         endpoint = f"/{api_base_path}/responses"
-        request_params["input"] = conversation[-1][
-            "message"
-        ]  # last message in the conversation is the user input
+        request_params["input"] = conversation[-1]["message"]
 
-        # Assign previous_response_id if relevant
         if self._last_response_id and self.entry.options.get(
             CONF_REMEMBER_CONVERSATION, DEFAULT_REMEMBER_CONVERSATION
         ):
-            # If the last response was generated recently, use it as a context
             configured_memory_time: datetime.timedelta = datetime.timedelta(
                 minutes=self.entry.options.get(
                     CONF_REMEMBER_CONVERSATION_TIME_MINUTES,
@@ -1537,13 +1513,6 @@ class GenericOpenAIResponsesAPIAgent(BaseOpenAICompatibleAPIAgent):
         return endpoint, request_params
 
     def _validate_response_payload(self, response_json: dict) -> bool:
-        """
-        Validate that the payload given matches the expected structure for the Responses API.
-
-        API ref: https://platform.openai.com/docs/api-reference/responses/object
-
-        Returns True or raises an error
-        """
         required_response_keys = ["object", "output", "status", "id"]
         missing_keys = [
             key for key in required_response_keys if key not in response_json
@@ -1568,11 +1537,6 @@ class GenericOpenAIResponsesAPIAgent(BaseOpenAICompatibleAPIAgent):
         return True
 
     def _check_response_status(self, response_json: dict) -> None:
-        """
-        Check the status of the response and logs a message if it is not 'completed'.
-
-        API ref: https://platform.openai.com/docs/api-reference/responses/object#responses_object-status
-        """
         if response_json["status"] != "completed":
             _LOGGER.warning(
                 f"Response status is not 'completed', got {response_json['status']}. Details: {response_json.get('incomplete_details', 'No details provided')}"
@@ -1617,7 +1581,6 @@ class GenericOpenAIResponsesAPIAgent(BaseOpenAICompatibleAPIAgent):
                 f"Response output content type is not expected, got {output_type}"
             )
 
-        # Save the response_id and return the successful response.
         response_id = response_json["id"]
         self._last_response_id = response_id
         self._last_response_id_time = datetime.datetime.now()
@@ -1625,8 +1588,6 @@ class GenericOpenAIResponsesAPIAgent(BaseOpenAICompatibleAPIAgent):
         return to_return
 
     async def _async_generate(self, conversation: dict) -> str:
-        """Generate a response using the OpenAI-compatible Responses API"""
-
         endpoint, additional_params = self._responses_params(conversation)
 
         result = await self._async_generate_with_parameters(
@@ -1682,7 +1643,7 @@ class TextGenerationWebuiAgent(GenericOpenAIAPIAgent):
             _LOGGER.debug("Connection error was: %s", repr(ex))
             raise ConfigEntryNotReady(
                 "There was a problem connecting to the remote server"
-            ) from ex
+            )
 
     def _chat_completion_params(self, conversation: dict) -> (str, dict):
         preset = self.entry.options.get(CONF_TEXT_GEN_WEBUI_PRESET)
@@ -1756,8 +1717,6 @@ class TextGenerationWebuiAgent(GenericOpenAIAPIAgent):
 
 
 class LlamaCppPythonAPIAgent(GenericOpenAIAPIAgent):
-    """https://llama-cpp-python.readthedocs.io/en/latest/server/"""
-
     grammar: str
 
     async def _async_load_model(self, entry: ConfigEntry):
@@ -1855,7 +1814,7 @@ class OllamaAPIAgent(LocalLLMAgent):
 
         endpoint = "/api/generate"
         request_params["prompt"] = self._format_prompt(conversation)
-        request_params["raw"] = True  # ignore prompt template
+        request_params["raw"] = True
 
         return endpoint, request_params
 
@@ -1864,12 +1823,6 @@ class OllamaAPIAgent(LocalLLMAgent):
             _LOGGER.warning(
                 "Model response did not end on a stop token (unfinished sentence)"
             )
-
-        # TODO: this doesn't work because ollama caches prompts and doesn't always return the full prompt length
-        # context_len = self.entry.options.get(CONF_CONTEXT_LENGTH, DEFAULT_CONTEXT_LENGTH)
-        # max_tokens = self.entry.options.get(CONF_MAX_TOKENS, DEFAULT_MAX_TOKENS)
-        # if response_json["prompt_eval_count"] + max_tokens > context_len:
-        #     self._warn_context_size()
 
         if "response" in response_json:
             return response_json["response"]
@@ -1899,7 +1852,7 @@ class OllamaAPIAgent(LocalLLMAgent):
         request_params = {
             "model": self.model_name,
             "stream": False,
-            "keep_alive": f"{keep_alive}m",  # prevent ollama from unloading the model
+            "keep_alive": f"{keep_alive}m",
             "options": {
                 "num_ctx": context_length,
                 "top_p": top_p,
