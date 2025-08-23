@@ -1,6 +1,7 @@
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import llm
+
 from .const import DOMAIN
 from .llm_api import MyAPI
 
