@@ -136,6 +136,8 @@ tmp_cache
 # python-language-server / Rope
 .ropeproject
 
+*/__pycache__/*
+
 # Will be created from script/split_tests.py
 pytest_buckets.txt
 
