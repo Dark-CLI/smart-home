@@ -1,10 +1,7 @@
 from __future__ import annotations
-
-import fnmatch
 from typing import Any
-
+import fnmatch
 import voluptuous as vol
-
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import llm
@@ -27,30 +24,30 @@ class GetServiceSchema(llm.Tool):
         self, hass: HomeAssistant, tool_input: ToolInput, llm_context: LLMContext
     ) -> dict[str, Any]:
         # TODO: Handle tool failure more gracefully instead of returning nothing, which can cause LLM hallucinations.
-        domain = tool_input.tool_args.get("domain")
-        service = tool_input.tool_args.get("service")
+        domain_filter = tool_input.tool_args.get("domain")
+        service_filter = tool_input.tool_args.get("service")
         out: dict[str, Any] = {}
-        for dom, services in hass.services.async_services().items():
-            if domain and dom != domain:
-                continue
-            if ALLOWED_DOMAINS and dom not in ALLOWED_DOMAINS:
-                continue
-            for srv, obj in services.items():
-                if service and srv != service:
+
+        domains_to_process = []
+        if domain_filter:
+            domains_to_process = [domain_filter]
+        else:
+            domains_to_process = list(ALLOWED_DOMAINS)
+
+        for dom in domains_to_process:
+            services_in_domain = hass.services.async_services_for_domain(dom)
+
+            for srv, obj in services_in_domain.items():
+                if service_filter and srv != service_filter:
                     continue
+
                 schema = getattr(obj, "schema", None)
                 fields_hint = []
-                # The schema can be a validator object (e.g., vol.All),
-                # which doesn't have a .schema attribute. Only vol.Schema objects
-                # have a .schema attribute that contains the schema dictionary.
                 if isinstance(schema, vol.Schema) and isinstance(schema.schema, dict):
                     fields_hint = [k.schema for k in schema.schema]
 
                 target_schema = getattr(obj, "target_schema", None)
                 target_hint = []
-                # The schema can be a validator object (e.g., vol.All),
-                # which doesn't have a .schema attribute. Only vol.Schema objects
-                # have a .schema attribute that contains the schema dictionary.
                 if isinstance(target_schema, vol.Schema) and isinstance(
                     target_schema.schema, dict
                 ):
@@ -98,9 +95,6 @@ class CallService(llm.Tool):
         print(f"  Target: {target}")
         print(f"  Blocking: {blocking}")
 
-        # if target:
-        #     data = {**data, "target": target}
-
         if ALLOWED_DOMAINS and dom not in ALLOWED_DOMAINS:
             raise HomeAssistantError(f"Domain not allowed: {dom}")
 
@@ -114,10 +108,10 @@ class CallService(llm.Tool):
                 context=llm_context.context,  # attribute to the convo user
             )
             print(f"  Result: {result}")
-            return {"ok": True, "result": result}
+            return {"status": "success", "result": result}
         except Exception as e:
             print(f"  Error calling service: {e}")
-            return {"ok": False, "error": str(e)}
+            return {"status": "error", "error_message": str(e)}
 
 
 class GetLiveContext(llm.Tool):
@@ -162,17 +156,18 @@ class MyAPI(llm.API):
             llm_context=llm_context,
             api_prompt=(
                 "**System Rules:**\n"
-                "- You are a voice assistant for Home Assistant.\n"
-                "- Your primary goal is to control devices and report their state.\n"
-                "- Be direct and to the point. Do not apologize or use conversational filler.\n"
+                "- Your primary goal is to control devices and report state. Be direct and to the point.\n"
+                "- CRITICAL: Never state that you have performed an action until you have received a '{\"status\": \"success\"}' response from the CallService tool. If the status is 'error', report the error message to the user.\n\n"
                 "**Tool Calling Rules:**\n"
-                "- You MUST use the `tool_calls` JSON field to execute tools.\n"
-                "- NEVER write a tool call as plain text in your response.\n\n"
+                "- You MUST use the `tool_calls` JSON field to execute tools. NEVER write a tool call as plain text in your response.\n"
+                "- Do NOT use tools to answer questions about your own past actions or the conversation history. Answer these from your internal memory.\n\n"
                 "**Protocol:**\n"
-                "1) First, use GetLiveContext to find the `entity_id` of the target device.\n"
-                "2) Next, use GetServiceSchema with only the `domain` of the entity you found. This will show you all available services for that device.\n"
-                "3) From the list of services, choose the most appropriate one and identify the parameters you need.\n"
-                "4) Finally, use CallService with the correct `domain`, `service`, `target`, and any `data` required.\n\n"
+                "1) First, use GetLiveContext to find the `entity_id` for the user's request.\n"
+                "2) CRITICAL: You MUST remember the `entity_id` you found. For subsequent commands about the same device, DO NOT call GetLiveContext again.\n"
+                "3) CRITICAL: Next, use GetServiceSchema with only the `domain` of the entity to see all available services and their parameters. You MUST perform this step even for simple actions like 'turn on' or 'turn off'.\n"
+                "4) From the list of services, choose the most appropriate one and identify the parameters you need.\n"
+                "5) Finally, use CallService. You MUST include the `target` dictionary containing the `entity_id` you found in step 1.\n"
+                "6) If the user's message is a simple greeting, closing, or conversational filler (like 'hello', 'thank you', 'ok', '.'), just provide a simple, friendly response without using any tools.\n\n"
                 "**Example:**\n"
                 "User: 'Set the AC to 20 degrees.'\n"
                 "Assistant Tool Call: GetLiveContext(entity_id_glob='*ac*')\n"
@@ -180,7 +175,7 @@ class MyAPI(llm.API):
                 "Assistant Tool Call: GetServiceSchema(domain='number')\n"
                 'Tool Output: {"number": {"set_value": {"fields_hint": ["value"], ...}}}\n'
                 "Assistant Tool Call: CallService(domain='number', service='set_value', target={'entity_id': 'number.devices_room_ac_temperature'}, data={'value': 20})\n"
-                'Tool Output: {"ok": true, "result": null}\n'
+                'Tool Output: {"status": "success", "result": null}\n'
                 "Assistant: 'Done. The AC temperature is set to 20.'\n"
             ),
             tools=[GetServiceSchema(), CallService(), GetLiveContext()],
